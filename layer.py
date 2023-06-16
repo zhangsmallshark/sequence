@@ -3,57 +3,70 @@
 
 # DeepSpeed Team
 
-# The file has been adapted from the following Megatron-LM file:
-# https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/mpu/mappings.py
-# Git commit hash: 9dc3c42a84aa656f583703cf8b6b4f79f712b796
-# We retain the following copyright from the original files:
-
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import torch
+from deepspeed.utils import log_dist
+
+from .mappings import sequence_all2all
+from deepspeed.runtime.utils import see_memory_usage
 
 
-def _all2all(input_,group, scatter_dim, gather_dim):
-    """All2All for sequence parallel"""
+class DistributedAttention(torch.nn.Module):
+    """Initialization.
 
-    shapes = list(input_.size())
-    seq_world_size = len(torch.distributed.get_process_group_ranks(group))
-    #if torch.distributed.get_rank() == 0:
-    #    print('FREEZE seq grp size ', seq_world_size)
-    shapes[scatter_dim] = shapes[scatter_dim] // seq_world_size
+    Arguments:
+        local_attention (Module): local attention with q,k,v
+        sequence_process_group (ProcessGroup): sequence parallel process group
+        scatter_idx (int): scatter_idx for all2all comm
+        gather_idx (int): gather_idx for all2all comm
+        TODO
+        (1) Create process group internal to deepspeed if none
+    """
 
-    input_list = [t.contiguous() for t in torch.tensor_split(input_, seq_world_size, scatter_dim)]
-    output_list = [torch.empty(*shapes, dtype=input_.dtype, device=input_.device) 
-                   for _ in range(seq_world_size)]
-    torch.distributed.all_to_all(output_list, input_list, group=group)
-    return torch.cat(output_list, dim=gather_dim).contiguous()
+    def __init__(self,
+                 local_attention,
+                 sequence_process_group,
+                 scatter_idx=2,
+                 gather_idx=0,
+                 ):
 
-class _SequenceAll2All(torch.autograd.Function):
-    """All2All."""
+        super(DistributedAttention, self).__init__()
+        self.local_attn = local_attention
+        self.spg = sequence_process_group 
+        self.scatter_idx = scatter_idx
+        self.gather_idx = gather_idx
+        
+    def forward(self, query, key, value):
+        """ forward
 
-    @staticmethod
-    def forward(ctx,input_,group,scatter_idx,gather_idx):
-        ctx.group = group #process group
-        ctx.scatter_idx = scatter_idx
-        ctx.gather_idx = gather_idx
-        return _all2all(input_,group,scatter_idx,gather_idx)
+        Arguments:
+            query (Tensor): query input to the layer
+            key (Tensor): key input to the layer
+            value (Tensor): value input to the layer
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        return _all2all(grad_output,ctx.group, ctx.gather_idx,ctx.scatter_idx),None,None,None
+        Returns:
+            * output (Tensor): context output in the format sq/p, b, h
+        """
+        #timers('Attn-preproc').stop()
+        #see_memory_usage(f"Before ALL2ALL QKV", force=True)
+        #log_dist('FREEZE  q k v PRE shape ', query.shape, key.shape, value.shape)
+        
+        #in shape : [s/p:h:]
+        query_layer = sequence_all2all(query,self.spg,self.scatter_idx,self.gather_idx)
+        key_layer = sequence_all2all(key,self.spg,self.scatter_idx,self.gather_idx)
+        value_layer = sequence_all2all(value,self.spg,self.scatter_idx,self.gather_idx)
+        
+        #out shape : [s:h/p:]
+        context_layer = self.local_attn(query_layer, key_layer, value_layer)
 
-
-def sequence_all2all(input_,group, scatter_idx,gather_idx):
-    return _SequenceAll2All.apply(input_,group,scatter_idx,gather_idx)
-
+    
+        #timers('Attn-ALL2ALLOUT').start()
+        
+        #in [s::h/p]
+        output = sequence_all2all(context_layer,self.spg, self.gather_idx,self.scatter_idx)
+        #out [s/p::h]
+        #log_dist('ALL2ALL out post ', context_layer.shape)
+        #timers('Attn-ALL2ALLOUT').stop()
+        #see_memory_usage(f"After ALL2ALL Context Layer ", force=True)
+        #print(f'context layer AFTER ALL {} '.format(context_layer.shape))
+        return output
+        
